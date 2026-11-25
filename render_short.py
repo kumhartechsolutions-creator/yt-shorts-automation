@@ -1,17 +1,19 @@
-"""Render 1080x1920 animated Arduino/ESP32 YouTube Shorts with Edge-TTS voiceover & SFX."""
+"""Render 1080x1920 photorealistic Arduino/ESP32 Shorts with live HUD, Edge-TTS & SFX."""
 
 from __future__ import annotations
 
 import asyncio
 import math
 import subprocess
+import urllib.parse
 import wave
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import edge_tts
 import imageio_ffmpeg
 import numpy as np
+import requests
 from PIL import Image, ImageDraw, ImageFont
 
 from projects import ShortProject
@@ -19,6 +21,7 @@ from projects import ShortProject
 WIDTH, HEIGHT = 1080, 1920
 FPS = 30
 VOICE = "en-US-ChristopherNeural"
+ASSETS_DIR = Path(__file__).parent / "assets"
 
 BG_TOP = (8, 12, 22)
 CYAN = (0, 230, 255)
@@ -26,8 +29,7 @@ EMERALD = (40, 235, 145)
 RED = (255, 65, 85)
 AMBER = (255, 195, 45)
 WHITE = (245, 248, 255)
-MUTED = (150, 165, 190)
-CARD_BG = (16, 22, 36)
+MUTED = (175, 190, 215)
 
 
 def _load_font(size: int, mono: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
@@ -44,11 +46,11 @@ def _load_font(size: int, mono: bool = False) -> ImageFont.FreeTypeFont | ImageF
     return ImageFont.load_default()
 
 
-FONT_HEAD = _load_font(68)
-FONT_SUB = _load_font(36)
-FONT_CAP = _load_font(52)
-FONT_MONO = _load_font(28, mono=True)
-FONT_SMALL = _load_font(28)
+FONT_HEAD = _load_font(64)
+FONT_SUB = _load_font(34)
+FONT_CAP = _load_font(50)
+FONT_MONO = _load_font(26, mono=True)
+FONT_SMALL = _load_font(26)
 
 
 async def _synthesize_tts(text: str, out_mp3: Path) -> None:
@@ -76,8 +78,6 @@ def _write_sfx_wav(out_wav: Path, duration: float, mode: str) -> None:
     n = int(sr * duration)
     buf = np.zeros(n, dtype=np.float32)
 
-    # Subtle periodic tech pulse/sonar ping every 1.2s + alert chirps near mid-video
-    t_all = np.arange(n, dtype=np.float32) / sr
     for beat in np.arange(0.3, duration - 1.0, 1.2):
         idx = int(beat * sr)
         length = min(int(0.18 * sr), n - idx)
@@ -85,10 +85,8 @@ def _write_sfx_wav(out_wav: Path, duration: float, mode: str) -> None:
             continue
         t = np.arange(length, dtype=np.float32) / sr
         freq = 880.0 if mode == "radar" else (523.25 if mode == "waveform" else 1600.0)
-        env = np.exp(-t * 18.0)
-        buf[idx : idx + length] += 0.14 * np.sin(2 * np.pi * freq * t) * env
+        buf[idx : idx + length] += 0.14 * np.sin(2 * np.pi * freq * t) * np.exp(-t * 18.0)
 
-    # Alert burst between 45% and 65% of clip
     for beat in np.arange(duration * 0.45, duration * 0.65, 0.22):
         idx = int(beat * sr)
         length = min(int(0.09 * sr), n - idx)
@@ -105,138 +103,175 @@ def _write_sfx_wav(out_wav: Path, duration: float, mode: str) -> None:
         wf.writeframes(pcm.tobytes())
 
 
-def _draw_grid_bg(draw: ImageDraw.ImageDraw) -> None:
-    for x in range(0, WIDTH, 90):
-        draw.line([(x, 0), (x, HEIGHT)], fill=(18, 26, 44), width=1)
-    for y in range(0, HEIGHT, 90):
-        draw.line([(0, y), (WIDTH, y)], fill=(18, 26, 44), width=1)
+def _get_hardware_background(project: ShortProject) -> Optional[Image.Image]:
+    """Load local asset from assets/<id>.png/.jpg or fetch photorealistic hardware image."""
+    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    for ext in (".png", ".jpg", ".jpeg", ".webp"):
+        local = ASSETS_DIR / f"{project.id}{ext}"
+        if local.exists():
+            return Image.open(local).convert("RGB")
+
+    if not project.image_prompt:
+        return None
+
+    cached = ASSETS_DIR / f"{project.id}.png"
+    url = (
+        "https://image.pollinations.ai/prompt/"
+        + urllib.parse.quote(project.image_prompt)
+        + "?width=1080&height=1920&nologo=true"
+    )
+    try:
+        print(f"Fetching photorealistic hardware visual for {project.id}...")
+        resp = requests.get(url, timeout=45)
+        resp.raise_for_status()
+        cached.write_bytes(resp.content)
+        return Image.open(cached).convert("RGB")
+    except Exception as exc:
+        print(f"Image fetch failed ({exc}); using fallback grid background.")
+        return None
 
 
-def _draw_radar_sim(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], t: float, dur: float) -> None:
+def _ken_burns_bg(src: Optional[Image.Image], progress: float) -> Image.Image:
+    if src is None:
+        img = Image.new("RGB", (WIDTH, HEIGHT), BG_TOP)
+        draw = ImageDraw.Draw(img)
+        for x in range(0, WIDTH, 90):
+            draw.line([(x, 0), (x, HEIGHT)], fill=(18, 26, 44), width=1)
+        for y in range(0, HEIGHT, 90):
+            draw.line([(0, y), (WIDTH, y)], fill=(18, 26, 44), width=1)
+        return img
+
+    # Smooth 1.0x -> 1.12x zoom + slight vertical pan
+    scale = 1.0 + 0.12 * progress
+    sw, sh = src.size
+    target_ratio = WIDTH / HEIGHT
+    if sw / sh > target_ratio:
+        crop_h = sh / scale
+        crop_w = crop_h * target_ratio
+    else:
+        crop_w = sw / scale
+        crop_h = crop_w / target_ratio
+
+    cx = sw * (0.50 + 0.02 * math.sin(progress * math.pi))
+    cy = sh * (0.48 + 0.04 * progress)
+    left = max(0.0, min(sw - crop_w, cx - crop_w / 2))
+    top = max(0.0, min(sh - crop_h, cy - crop_h / 2))
+    cropped = src.crop((left, top, left + crop_w, top + crop_h))
+    return cropped.resize((WIDTH, HEIGHT), Image.Resampling.BILINEAR)
+
+
+def _draw_radar_hud(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], t: float, dur: float) -> None:
     x0, y0, x1, y1 = box
-    cx, cy = (x0 + x1) // 2, y1 - 95
-    radius = 340
-
-    # Sweep 15..165 deg back and forth
-    phase = (math.sin(t * 2.1 - math.pi / 2) + 1.0) / 2.0
+    cx, cy = (x0 + x1) // 2, y1 - 36
+    radius = 155
+    phase = (math.sin(t * 2.2 - math.pi / 2) + 1.0) / 2.0
     angle = 15 + phase * 150
     rad = math.radians(angle)
 
-    # Target active in middle portion of video
-    target_angle = 78.0
     target_cm = 12 if (dur * 0.35 <= t <= dur * 0.72) else 34
     alert = target_cm <= 25
 
     for r in (radius, radius * 2 // 3, radius // 3):
-        draw.arc([cx - r, cy - r, cx + r, cy + r], start=180, end=360, fill=(25, 95, 85), width=3)
-    draw.line([(cx - radius, cy), (cx + radius, cy)], fill=(35, 115, 100), width=3)
+        draw.arc([cx - r, cy - r, cx + r, cy + r], start=180, end=360, fill=(35, 130, 115), width=2)
+    draw.line([(cx - radius, cy), (cx + radius, cy)], fill=(45, 145, 125), width=2)
 
-    # Sweep beam
     sx = cx + int(math.cos(rad) * radius)
     sy = cy - int(math.sin(rad) * radius)
-    draw.line([(cx, cy), (sx, sy)], fill=EMERALD, width=6)
+    draw.line([(cx, cy), (sx, sy)], fill=EMERALD, width=5)
 
-    # Target blip
     tr = int((target_cm / 40.0) * radius)
-    trad = math.radians(target_angle)
+    trad = math.radians(78.0)
     tx = cx + int(math.cos(trad) * tr)
     ty = cy - int(math.sin(trad) * tr)
-    blip_color = RED if alert else AMBER
-    draw.ellipse([tx - 16, ty - 16, tx + 16, ty + 16], fill=blip_color, outline=WHITE, width=3)
-
-    status = f"ANG: {int(angle)}°   DIST: {target_cm} CM {'ALERT!' if alert else 'OK'}"
-    draw.text((x0 + 42, y0 + 36), status, font=FONT_SUB, fill=RED if alert else CYAN)
+    draw.ellipse([tx - 10, ty - 10, tx + 10, ty + 10], fill=RED if alert else AMBER, outline=WHITE, width=2)
+    draw.text((x0 + 24, y0 + 20), f"LIVE OLED: {target_cm} CM {'ALERT!' if alert else ''}", font=FONT_SMALL, fill=RED if alert else CYAN)
 
 
-def _draw_waveform_sim(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], t: float, dur: float) -> None:
+def _draw_waveform_hud(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], t: float, dur: float) -> None:
     x0, y0, x1, y1 = box
     notes = ["C4", "D4", "E4", "F4", "G4", "A4", "B4", "C5"]
-    idx = int((t * 1.8)) % len(notes)
-    dist = 8 + idx * 4
-    draw.text((x0 + 42, y0 + 36), f"HAND: {dist} CM   NOTE: {notes[idx]}", font=FONT_SUB, fill=CYAN)
-
-    bar_w = 68
-    gap = 26
-    start_x = x0 + 65
-    base_y = y1 - 80
+    idx = int(t * 1.8) % len(notes)
+    draw.text((x0 + 24, y0 + 20), f"LIVE NOTE: {notes[idx]} ({8 + idx * 4} CM)", font=FONT_SMALL, fill=CYAN)
+    base_y = y1 - 28
     for i in range(8):
-        bx = start_x + i * (bar_w + gap)
-        h = 340 if i == idx else int(80 + 40 * math.sin(t * 4 + i))
-        color = EMERALD if i == idx else (35, 65, 95)
-        draw.rounded_rectangle([bx, base_y - h, bx + bar_w, base_y], radius=12, fill=color)
-        draw.text((bx + 12, base_y + 18), notes[i], font=FONT_SMALL, fill=WHITE if i == idx else MUTED)
+        bx = x0 + 28 + i * 48
+        h = 130 if i == idx else int(35 + 18 * math.sin(t * 4 + i))
+        draw.rounded_rectangle([bx, base_y - h, bx + 34, base_y], radius=8, fill=EMERALD if i == idx else (45, 75, 110))
 
 
-def _draw_laser_sim(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], t: float, dur: float) -> None:
+def _draw_laser_hud(draw: ImageDraw.ImageDraw, box: Tuple[int, int, int, int], t: float, dur: float) -> None:
     x0, y0, x1, y1 = box
     tripped = dur * 0.38 <= t <= dur * 0.72
-    cy = (y0 + y1) // 2 + 20
-
-    draw.rounded_rectangle([x0 + 50, cy - 45, x0 + 160, cy + 45], radius=12, fill=(45, 55, 75), outline=CYAN, width=3)
-    draw.rounded_rectangle([x1 - 160, cy - 45, x1 - 50, cy + 45], radius=12, fill=(45, 55, 75), outline=AMBER, width=3)
-    draw.text((x0 + 62, cy + 60), "LASER", font=FONT_SMALL, fill=MUTED)
-    draw.text((x1 - 140, cy + 60), "LDR", font=FONT_SMALL, fill=MUTED)
-
-    beam_end = (x0 + x1) // 2 if tripped else (x1 - 160)
-    draw.line([(x0 + 160, cy), (beam_end, cy)], fill=RED, width=10)
-    if tripped:
-        draw.rounded_rectangle([(x0 + x1) // 2 - 22, cy - 110, (x0 + x1) // 2 + 22, cy + 110], radius=14, fill=AMBER)
-    status = "BEAM BROKEN - ALARM ON!" if tripped else "LASER LOCKED - SECURE"
-    draw.text((x0 + 42, y0 + 36), status, font=FONT_SUB, fill=RED if tripped else EMERALD)
+    cy = (y0 + y1) // 2 + 15
+    draw.line([(x0 + 30, cy), ((x0 + x1) // 2 if tripped else x1 - 30, cy)], fill=RED, width=8)
+    draw.text((x0 + 24, y0 + 20), "BEAM BROKEN!" if tripped else "LASER LOCKED", font=FONT_SMALL, fill=RED if tripped else EMERALD)
 
 
-SIM_RENDERERS = {
-    "radar": _draw_radar_sim,
-    "waveform": _draw_waveform_sim,
-    "laser": _draw_laser_sim,
+HUD_RENDERERS = {
+    "radar": _draw_radar_hud,
+    "waveform": _draw_waveform_hud,
+    "laser": _draw_laser_hud,
 }
 
 
-def _render_frame(project: ShortProject, frame_idx: int, total_frames: int) -> bytes:
+def _render_frame(project: ShortProject, bg_src: Optional[Image.Image], frame_idx: int, total_frames: int) -> bytes:
     t = frame_idx / FPS
     dur = total_frames / FPS
-    img = Image.new("RGB", (WIDTH, HEIGHT), BG_TOP)
+    progress = frame_idx / max(total_frames - 1, 1)
+
+    base = _ken_burns_bg(bg_src, progress).convert("RGBA")
+
+    # Dark translucent top/bottom scrims so text & HUD pop over real hardware photos
+    overlay = Image.new("RGBA", (WIDTH, HEIGHT), (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+    odraw.rectangle([0, 0, WIDTH, 360], fill=(8, 12, 22, 185))
+    odraw.rectangle([0, 1020, WIDTH, HEIGHT], fill=(8, 12, 22, 200))
+
+    # Compact floating OLED HUD card in upper-right corner (keeps center hardware visible)
+    hud_box = (590, 380, 1020, 645)
+    odraw.rounded_rectangle(hud_box, radius=24, fill=(10, 16, 30, 215), outline=(0, 230, 255, 220), width=3)
+
+    # Code card & caption bar
+    code_box = (60, 1050, 1020, 1320)
+    odraw.rounded_rectangle(code_box, radius=22, fill=(10, 15, 28, 225), outline=(55, 80, 120, 220), width=3)
+    odraw.rounded_rectangle([60, 1365, 1020, 1495], radius=24, fill=(14, 22, 38, 235), outline=(0, 230, 255, 240), width=4)
+
+    img = Image.alpha_composite(base, overlay).convert("RGB")
     draw = ImageDraw.Draw(img)
-    _draw_grid_bg(draw)
 
     # Top hook pills & headline
-    draw.rounded_rectangle([70, 110, 420, 175], radius=24, fill=(18, 45, 70), outline=CYAN, width=3)
-    draw.text((98, 124), project.hook_badge, font=FONT_SUB, fill=CYAN)
+    draw.rounded_rectangle([60, 95, 410, 158], radius=22, fill=(18, 45, 70), outline=CYAN, width=3)
+    draw.text((88, 108), project.hook_badge, font=FONT_SUB, fill=CYAN)
 
-    draw.rounded_rectangle([760, 110, 1010, 175], radius=24, fill=(20, 65, 45), outline=EMERALD, width=3)
-    draw.text((795, 124), project.cost_label, font=FONT_SUB, fill=EMERALD)
+    draw.rounded_rectangle([760, 95, 1020, 158], radius=22, fill=(20, 65, 45), outline=EMERALD, width=3)
+    draw.text((795, 108), project.cost_label, font=FONT_SUB, fill=EMERALD)
 
-    draw.text((70, 215), project.hook_headline, font=FONT_HEAD, fill=WHITE)
+    draw.text((60, 192), project.hook_headline, font=FONT_HEAD, fill=WHITE)
 
-    # Central simulation card
-    sim_box = (70, 350, 1010, 960)
-    draw.rounded_rectangle(sim_box, radius=32, fill=CARD_BG, outline=(45, 70, 105), width=4)
-    SIM_RENDERERS.get(project.sim_mode, _draw_radar_sim)(draw, sim_box, t, dur)
+    # Live OLED/Sensor HUD
+    HUD_RENDERERS.get(project.sim_mode, _draw_radar_hud)(draw, hud_box, t, dur)
 
-    # Code card
-    code_box = (70, 1005, 1010, 1310)
-    draw.rounded_rectangle(code_box, radius=24, fill=(12, 16, 28), outline=(45, 60, 90), width=3)
-    draw.text((100, 1025), f"FILE: {project.code_filename}", font=FONT_SMALL, fill=AMBER)
+    # Code snippet
+    draw.text((90, 1072), f"FILE: {project.code_filename}", font=FONT_SMALL, fill=AMBER)
     for i, line in enumerate(project.code_snippet.splitlines()[:4]):
-        draw.text((100, 1080 + i * 48), line, font=FONT_MONO, fill=EMERALD)
+        draw.text((90, 1122 + i * 44), line, font=FONT_MONO, fill=EMERALD)
 
-    # Phrase-synced caption in safe lower-third
+    # Synced caption
     captions = project.captions or [project.hook_headline]
-    cap_idx = min(int((frame_idx / total_frames) * len(captions)), len(captions) - 1)
-    cap = captions[cap_idx]
-    draw.rounded_rectangle([70, 1380, 1010, 1510], radius=26, fill=(18, 25, 42), outline=CYAN, width=4)
-    draw.text((105, 1418), cap, font=FONT_CAP, fill=WHITE)
+    cap_idx = min(int(progress * len(captions)), len(captions) - 1)
+    draw.text((95, 1400), captions[cap_idx], font=FONT_CAP, fill=WHITE)
 
-    # Bottom channel branding
-    draw.text((70, 1575), "Zahid Bashir Young Innovator  |  Subscribe!", font=FONT_SUB, fill=MUTED)
+    # Channel CTA
+    draw.text((60, 1545), "Zahid Bashir Young Innovator  |  Subscribe!", font=FONT_SUB, fill=MUTED)
     return img.tobytes()
 
 
 def render_short_video(project: ShortProject, out_dir: Path) -> Path:
-    """Generate voiceover, SFX, and animated 1080x1920 MP4 for a project."""
+    """Generate voiceover, SFX, photorealistic hardware background & 1080x1920 MP4."""
     out_dir.mkdir(parents=True, exist_ok=True)
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
 
+    bg_src = _get_hardware_background(project)
     voice_mp3 = out_dir / f"{project.id}_voice.mp3"
     sfx_wav = out_dir / f"{project.id}_sfx.wav"
     final_mp4 = out_dir / f"{project.id}.mp4"
@@ -273,7 +308,7 @@ def render_short_video(project: ShortProject, out_dir: Path) -> Path:
     assert proc.stdin is not None
     try:
         for i in range(total_frames):
-            proc.stdin.write(_render_frame(project, i, total_frames))
+            proc.stdin.write(_render_frame(project, bg_src, i, total_frames))
         proc.stdin.close()
     finally:
         ret = proc.wait()

@@ -35,6 +35,7 @@ class ShortProject:
     pinned_comment: str
     gist_url: Optional[str] = None
     captions: List[str] = field(default_factory=list)
+    image_prompt: str = ""
 
 
 PROJECTS: List[ShortProject] = [
@@ -120,6 +121,11 @@ PROJECTS: List[ShortProject] = [
             "Buzzer fires under 25 cm!",
             "Code in pinned comment 👇",
         ],
+        image_prompt=(
+            "macro studio photography of an ESP32 DevKit on a breadboard wired with colorful jumper wires "
+            "to an HC-SR04 ultrasonic sensor mounted on a blue SG90 micro servo, a glowing 0.96 inch OLED display, "
+            "and a red LED on a dark electronics workbench, dramatic cyan rim light, photorealistic, 8k"
+        ),
     ),
     ShortProject(
         id="arduino-ultrasonic-piano",
@@ -190,6 +196,11 @@ PROJECTS: List[ShortProject] = [
             "8-note C-major scale live!",
             "Code in pinned comment 👇",
         ],
+        image_prompt=(
+            "macro studio photography of an Arduino Uno R3 on a dark electronics workbench wired to an HC-SR04 "
+            "ultrasonic sensor and a black piezo buzzer on a breadboard with colorful jumper wires, "
+            "dramatic neon blue and emerald lighting, photorealistic, 8k"
+        ),
     ),
     ShortProject(
         id="arduino-laser-tripwire",
@@ -257,6 +268,11 @@ PROJECTS: List[ShortProject] = [
             "20 lines of Arduino code!",
             "Code in pinned comment 👇",
         ],
+        image_prompt=(
+            "macro studio photography of an Arduino Uno wired on a breadboard with a glowing red KY-008 laser module "
+            "shining a bright red beam onto an LDR photoresistor and piezo buzzer on a dark electronics workbench, "
+            "dramatic moody lighting, photorealistic, 8k"
+        ),
     ),
 ]
 
